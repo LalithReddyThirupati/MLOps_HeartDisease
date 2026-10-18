@@ -1,0 +1,16 @@
+global:
+  scrape_interval: 5s
+
+scrape_configs:
+  # API container started by docker compose
+  - job_name: heart-api-compose
+    metrics_path: /metrics/
+    static_configs:
+      - targets: ["api:8000"]
+
+  # API running on Docker Desktop Kubernetes (LoadBalancer on localhost:8080).
+  # Shows as DOWN until the k8s deployment is up - that is expected.
+  - job_name: heart-api-k8s
+    metrics_path: /metrics/
+    static_configs:
+      - targets: ["host.docker.internal:8080"]

@@ -1,0 +1,114 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+env:
+  PYTHON_VERSION: "3.11"
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+      - run: pip install flake8==7.1.1
+      - name: flake8
+        run: flake8 src api tests --count --show-source --statistics
+
+  test:
+    needs: lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+      - run: pip install -r requirements.txt
+      - name: pytest
+        run: |
+          mkdir -p reports
+          pytest -v --cov=src --cov=api --cov-report=term-missing \
+                 --cov-report=xml:reports/coverage.xml --junitxml=reports/junit.xml
+      - name: Upload test reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-reports
+          path: reports/
+
+  train:
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+      - run: pip install -r requirements.txt
+      - name: Get data (uses committed cleaned CSV if present)
+        run: |
+          if [ ! -f data/processed/heart_clean.csv ]; then
+            python -m src.download_data
+            python -m src.data_processing
+          fi
+      - name: Train and track
+        run: python -m src.train 2>&1 | tee reports_train.log
+      - name: Upload model
+        uses: actions/upload-artifact@v4
+        with:
+          name: model
+          path: |
+            models/model.joblib
+            models/metadata.json
+      - name: Upload MLflow runs and training reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: training-run
+          path: |
+            mlruns/
+            reports/
+            reports_train.log
+
+  docker:
+    needs: train
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: model
+          path: models/
+      - name: Build image
+        run: docker build -t heart-disease-api:${{ github.sha }} .
+      - name: Run container and smoke-test /predict
+        run: |
+          docker run -d --name api -p 8000:8000 heart-disease-api:${{ github.sha }}
+          for i in $(seq 1 30); do
+            curl -sf http://localhost:8000/health && break
+            sleep 1
+          done
+          curl -sf http://localhost:8000/health
+          RESPONSE=$(curl -sf -X POST http://localhost:8000/predict \
+                       -H "Content-Type: application/json" -d @samples/sample_request.json)
+          echo "$RESPONSE" | tee predict_response.json
+          echo "$RESPONSE" | jq -e '.prediction != null and .confidence >= 0.5'
+      - name: Container logs
+        if: always()
+        run: docker logs api > container.log 2>&1 || true
+      - name: Upload smoke-test evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: docker-smoke-test
+          path: |
+            container.log
+            predict_response.json
